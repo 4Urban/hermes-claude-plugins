@@ -93,6 +93,28 @@ def make_marketplace(base: Path, hooks_extra=None) -> Path:
     return mkt
 
 
+def select_plugins(enabled=(), disabled=()):
+    """Write Hermes's plugin selection (config.yaml; JSON is valid YAML)."""
+    paths.ensure(paths.hermes_home())
+    (paths.hermes_home() / "config.yaml").write_text(json.dumps(
+        {"plugins": {"enabled": list(enabled), "disabled": list(disabled)}}))
+
+
+def make_plugin(mkt: Path, name: str, hook_cmd: str = None):
+    """Add another plugin (optionally with one SessionStart hook) to a marketplace tree."""
+    plug = mkt / "plugins" / name
+    (plug / ".claude-plugin").mkdir(parents=True)
+    (plug / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": name, "version": "1.0.0"}))
+    if hook_cmd:
+        (plug / "hooks").mkdir()
+        (plug / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": hook_cmd}]}]}}))
+    data = json.loads((mkt / ".claude-plugin" / "marketplace.json").read_text())
+    data["plugins"].append({"name": name, "source": "./plugins/" + name})
+    (mkt / ".claude-plugin" / "marketplace.json").write_text(json.dumps(data))
+    return plug
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         shutil.rmtree(paths.hermes_home(), ignore_errors=True)
@@ -100,6 +122,7 @@ class Base(unittest.TestCase):
         self.mkt = make_marketplace(self.work)
         os.environ["MARKER_DIR"] = str(self.work)
         ops.marketplace_add(str(self.mkt))
+        select_plugins(enabled=["claude-demo"])
 
 
 class TestSources(unittest.TestCase):
@@ -230,6 +253,120 @@ class TestHookBridge(Base):
         self.assertFalse(Path(self.bridge._transcript_path("s4")).exists())
 
 
+class TestSecurity(Base):
+    """Regression tests for the four hardening fixes."""
+
+    def _marketplace_named(self, name):
+        bad = self.work / ("bad-%d" % abs(hash(name)))
+        (bad / ".claude-plugin").mkdir(parents=True)
+        (bad / ".claude-plugin" / "marketplace.json").write_text(json.dumps({"name": name, "plugins": []}))
+        return bad
+
+    # 1. a marketplace chooses its own name; it must not pick the directory that gets replaced
+    def test_marketplace_name_cannot_escape(self):
+        victim = paths.hermes_home() / "plugins" / "victim"
+        victim.mkdir(parents=True)
+        (victim / "keep").write_text("x")
+        for name in ("../../plugins/victim", "../victim", str(victim), "a/b", "..", ".hidden", ""):
+            with self.assertRaises(Exception, msg=name):
+                ops.marketplace_add(str(self._marketplace_named(name)))
+        with self.assertRaises(Exception):
+            ops.marketplace_add(str(self.mkt), name="../../plugins/victim")
+        self.assertEqual((victim / "keep").read_text(), "x")
+        self.assertEqual(sorted(store.load()["marketplaces"]), ["testmkt"])
+        with self.assertRaises(Exception):
+            ops.marketplace_remove("../../plugins/victim")
+        self.assertTrue(victim.is_dir())
+
+    # 2. consent covers the scripts a hook runs, not only the hook's command line
+    def test_changed_script_withdraws_consent(self):
+        ops.install("demo", accept_hooks=True)
+        bridge = hookbridge.Bridge()
+        self.assertEqual(len(bridge.entries("SessionStart")), 1)
+        (self.mkt / "plugins" / "demo" / "hooks" / "hook.py").write_text("print('changed')\n")
+        ops.update("demo")
+        rec = store.load()["plugins"]["demo@testmkt"]
+        self.assertFalse(rec["hooks_consent"])
+        self.assertEqual(bridge.entries("SessionStart"), [])
+
+    def test_tampered_package_stops_hooks(self):
+        ops.install("demo", accept_hooks=True)
+        bridge = hookbridge.Bridge()
+        self.assertEqual(len(bridge.entries("PreToolUse")), 1)
+        (paths.package_dir("demo") / "hooks" / "hook.py").write_text("print('tampered')\n")
+        self.assertEqual(bridge.entries("PreToolUse"), [], "edited files on disk are not run")
+        with self.assertRaises(ops.OpError):
+            ops.consent("demo")
+        ops.sync()  # reinstall from the marketplace restores the accepted files
+        self.assertTrue(store.load()["plugins"]["demo@testmkt"]["hooks_consent"])
+        self.assertEqual(len(bridge.entries("PreToolUse")), 1)
+
+    # 3. a same-named plugin from another marketplace must not take over the package
+    def test_same_name_other_marketplace_refused(self):
+        ops.install("demo", accept_hooks=True)
+        before = translate.tree_digest(paths.package_dir("demo"))
+        other = self.work / "other"
+        shutil.copytree(self.mkt, other)
+        data = json.loads((other / ".claude-plugin" / "marketplace.json").read_text())
+        data["name"] = "othermkt"
+        (other / ".claude-plugin" / "marketplace.json").write_text(json.dumps(data))
+        (other / "plugins" / "demo" / "hooks" / "hook.py").write_text("print('evil')\n")
+        ops.marketplace_add(str(other))
+        with self.assertRaises(ops.OpError):
+            ops.install("demo@othermkt")
+        self.assertEqual(translate.tree_digest(paths.package_dir("demo")), before)
+        self.assertEqual(sorted(store.load()["plugins"]), ["demo@testmkt"])
+        self.assertEqual(len(hookbridge.Bridge().entries("SessionStart")), 1)
+
+    def test_foreign_package_dir_left_alone(self):
+        foreign = paths.packages_dir() / "claude-mine"
+        foreign.mkdir(parents=True)
+        (foreign / "plugin.yaml").write_text("name: claude-mine\n")
+        make_plugin(self.mkt, "mine")
+        ops.marketplace_update("testmkt")
+        with self.assertRaises(Exception):
+            ops.install("mine")
+        self.assertEqual((foreign / "plugin.yaml").read_text(), "name: claude-mine\n")
+
+    def test_command_skill_name_clash_not_overwritten(self):
+        ops.install("demo")
+        hello = paths.command_skills_dir() / "demo-hello" / "SKILL.md"
+        before = hello.read_text()
+        plug = make_plugin(self.mkt, "demo-x")
+        (plug / "commands").mkdir()
+        (plug / "commands" / "y.md").write_text("fine\n")
+        clash = paths.command_skills_dir() / "demo-x-y"
+        clash.mkdir(parents=True)
+        (clash / "SKILL.md").write_text("someone else's")
+        (clash / ".claude-plugin-owner").write_text("demo\n")
+        ops.marketplace_update("testmkt")
+        report = "\n".join(ops.install("demo-x"))
+        self.assertIn("belongs to another plugin", report)
+        self.assertEqual((clash / "SKILL.md").read_text(), "someone else's")
+        self.assertEqual(hello.read_text(), before)
+
+    # 4. hooks follow Hermes's enable/disable of the package
+    def test_disabled_package_runs_no_hooks(self):
+        ops.install("demo", accept_hooks=True)
+        bridge = hookbridge.Bridge()
+        self.assertEqual(len(bridge.entries("SessionStart")), 1)
+        select_plugins(enabled=["claude-demo"], disabled=["claude-demo"])
+        os.utime(paths.hermes_home() / "config.yaml", (1, 1))  # force a visible mtime change
+        self.assertEqual(bridge.entries("SessionStart"), [])
+        select_plugins(enabled=[])
+        self.assertEqual(hookbridge.Bridge().entries("SessionStart"), [])
+        (paths.hermes_home() / "config.yaml").write_text("{not json or yaml: [")
+        self.assertEqual(hookbridge.Bridge().entries("SessionStart"), [], "unreadable selection fails closed")
+        select_plugins(enabled=["claude-demo"])
+        self.assertEqual(len(hookbridge.Bridge().entries("SessionStart")), 1)
+        self.assertIsNone(hookbridge.Bridge().pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="d"))
+        os.environ["HERMES_SAFE_MODE"] = "1"
+        try:
+            self.assertEqual(hookbridge.Bridge().entries("SessionStart"), [])
+        finally:
+            os.environ.pop("HERMES_SAFE_MODE")
+
+
 class TestRegister(unittest.TestCase):
     def test_register(self):
         seen = {"cli": [], "cmd": [], "hooks": []}
@@ -261,6 +398,7 @@ class TestRealPlugin(unittest.TestCase):
     def test_sharedbrain(self):
         shutil.rmtree(paths.hermes_home(), ignore_errors=True)
         ops.marketplace_add(str(SHAREDBRAIN))
+        select_plugins(enabled=["claude-mempalace-sharedbrain"])
         report = "\n".join(ops.install("mempalace-sharedbrain", accept_hooks=True))
         self.assertIn("/mempalace-sharedbrain-inbox", report)
         if "modules" in json.loads((SHAREDBRAIN / "hooks" / "hooks.json").read_text()):

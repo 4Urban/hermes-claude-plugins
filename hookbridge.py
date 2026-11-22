@@ -10,8 +10,10 @@ PreToolUse          pre_tool_call          deny (or exit code 2) blocks the tool
 PostToolUse         post_tool_call         run for its side effects; output is logged
 SessionEnd          on_session_finalize    run for its side effects
 
-Hooks run only for plugins whose hooks the user accepted (`hermes claude-plugins consent`), and only
-for the exact hooks they accepted: an update that changes a plugin's hooks withdraws consent.
+Hooks run only for plugins whose hooks the user accepted (`hermes claude-plugins consent`), only
+for the exact hooks and package files they accepted (an update that changes a plugin's hooks or any
+file in its package withdraws consent, and the files are checked again before hooks run), and only
+while Hermes has the plugin's package enabled (`hermes plugins disable claude-<name>` stops them).
 Commands run through /bin/sh with Claude Code's stdin JSON and environment (CLAUDE_PLUGIN_ROOT,
 CLAUDE_PROJECT_DIR). Hooks that read `transcript_path` get a Claude-format JSONL transcript
 written from the Hermes conversation.
@@ -22,8 +24,9 @@ import os
 import re
 import subprocess
 import threading
+from pathlib import Path
 
-from . import paths, store, translate
+from . import hermes_glue, paths, store, translate
 
 logger = logging.getLogger("hermes_claude_plugins.hooks")
 
@@ -40,37 +43,78 @@ class Bridge:
         self._lock = threading.Lock()
         self._entries = []
         self._state_mtime = None
+        self._verified = {}         # package root -> (fingerprint, digest) of the last full hash
         self._seen_sessions = set()
         self._pending = {}          # session_id -> [messages to deliver next turn]
         self._stop_active = set()   # sessions whose last Stop hook asked to continue
 
     # ---- registry -------------------------------------------------------
-    def _reload(self):
+    @staticmethod
+    def _mtime(path):
         try:
-            mtime = os.path.getmtime(paths.state_file())
+            return os.path.getmtime(path)
         except OSError:
-            mtime = None
+            return None
+
+    def _reload(self):
+        mtime = (self._mtime(paths.state_file()), self._mtime(hermes_glue.config_path()))
         if mtime == self._state_mtime:
             return
         self._state_mtime = mtime
         entries = []
+        if os.environ.get("HERMES_SAFE_MODE", "").strip().lower() in ("1", "true", "yes", "on"):
+            self._entries = entries
+            return
+        selection = hermes_glue.plugin_selection()
+        if selection is None:
+            logger.warning("claude-plugins: Hermes plugin selection is unreadable; no Claude Code hooks will run")
+            self._entries = entries
+            return
+        enabled, disabled = selection
         for key, rec in store.load()["plugins"].items():
-            if not rec.get("hooks_consent") or rec.get("disabled"):
+            if not rec.get("hooks_consent") or rec.get("disabled") or not rec.get("consented_digest"):
+                continue
+            package = rec.get("package_name") or paths.package_name(rec.get("name", ""))
+            if package not in enabled or package in disabled:
                 continue
             hooks = rec.get("hooks") or {}
-            if translate.hooks_digest(hooks) != rec.get("consented_digest"):
-                continue
             for event, matcher, command, timeout in translate.hook_commands(hooks):
                 if event in translate.SUPPORTED_EVENTS:
                     entries.append({"plugin": rec["name"], "key": key, "root": rec["package"], "event": event,
-                                    "matcher": matcher or "", "command": command, "timeout": timeout})
+                                    "matcher": matcher or "", "command": command, "timeout": timeout,
+                                    "hooks": hooks, "digest": rec["consented_digest"],
+                                    "data": str(paths.hermes_home() / "plugin-data" / package)})
         self._entries = entries
         logger.debug("claude-plugins hook bridge: %d hooks active", len(entries))
+
+    def _intact(self, entry):
+        """True when the package on disk still matches what the user accepted. A cheap stat listing
+        decides whether the files need hashing again, so unchanged packages cost one directory walk."""
+        root = entry["root"]
+        try:
+            if translate.package_owner(root) not in ("", entry["key"]):
+                return False
+            fingerprint = translate.tree_fingerprint(root)
+            cached = self._verified.get(root)
+            if cached and cached[0] == fingerprint:
+                digest = cached[1]
+            else:
+                digest = translate.hooks_digest(entry["hooks"], root)
+                self._verified[root] = (fingerprint, digest)
+        except (OSError, translate.TranslateError):
+            return False
+        if digest != entry["digest"]:
+            logger.warning("claude-plugins: files of %s changed since its hooks were accepted; not running them. "
+                           "Review with `hermes claude-plugins show %s`, then accept again.", entry["key"], entry["key"])
+            return False
+        return True
 
     def entries(self, event):
         with self._lock:
             self._reload()
-            return [e for e in self._entries if e["event"] == event]
+            candidates = [e for e in self._entries if e["event"] == event]
+            ok = {}
+            return [e for e in candidates if ok.setdefault(e["key"], self._intact(e))]
 
     # ---- running one hook -------------------------------------------------
     @staticmethod
@@ -91,8 +135,13 @@ class Bridge:
         """Return (exit code, parsed JSON or None, stdout text, stderr text)."""
         cwd = payload.get("cwd") or self._cwd()
         env = dict(os.environ)
-        env.update({"CLAUDE_PLUGIN_ROOT": entry["root"], "CLAUDE_PROJECT_DIR": cwd,
+        env.update({"CLAUDE_PLUGIN_ROOT": entry["root"], "CLAUDE_PLUGIN_DATA": entry.get("data", ""), "CLAUDE_PROJECT_DIR": cwd,
                     "HERMES_CLAUDE_PLUGINS": "1", "HERMES_SESSION_ID": str(payload.get("session_id") or "")})
+        if entry.get("data"):
+            try:
+                paths.ensure(Path(entry["data"]), private=True)
+            except OSError:
+                pass
         timeout = min(float(entry.get("timeout") or HOOK_TIMEOUT_CAP), HOOK_TIMEOUT_CAP)
         try:
             proc = subprocess.run(["/bin/sh", "-c", entry["command"]], input=json.dumps(payload), capture_output=True,

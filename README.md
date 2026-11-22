@@ -56,11 +56,25 @@ hermes claude-plugins consent mempalace-sharedbrain     # allow them
 hermes claude-plugins consent mempalace-sharedbrain --revoke
 ```
 
-`install --accept-hooks` accepts them at install time. Consent covers the exact hooks you saw: an
-update that changes a plugin's hooks switches them off until you accept again.
+`install --accept-hooks` accepts them at install time. Consent covers the exact hooks you saw and
+every file in the installed package: an update that changes a plugin's hooks or any script they run
+switches them off until you accept again, and the package files are checked again before hooks run,
+so a file edited on disk is not run either. Hooks also run only while Hermes has the package enabled:
+`hermes plugins disable claude-<plugin>` stops its hooks along with its skills and MCP servers, and
+an unreadable plugin selection or `HERMES_SAFE_MODE` runs none.
+
+Hooks accepted under 0.1.1 or earlier need accepting again after upgrading, because consent now
+covers the package files as well.
+
+Each plugin owns its package directory. Installing a plugin whose name is already installed from
+another marketplace, or whose `claude-<plugin>` directory belongs to something else, is refused
+until you uninstall the other one. Marketplace names must be a single plain name (letters, digits,
+dots, hyphens, underscores); pass `--name` to choose one when a marketplace's own name is refused.
 
 Each hook runs through `/bin/sh` with the JSON on stdin and the environment Claude Code gives it
-(`CLAUDE_PLUGIN_ROOT`, `CLAUDE_PROJECT_DIR`). Hooks that read `transcript_path` get a Claude-format
+(`CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR`). `CLAUDE_PLUGIN_DATA` is
+`$HERMES_HOME/plugin-data/claude-<plugin>/`, outside the package, so plugins can keep state there
+without changing the files their consent covers. Hooks that read `transcript_path` get a Claude-format
 transcript written from the Hermes conversation.
 
 | Claude Code event | Hermes hook | Behaviour |

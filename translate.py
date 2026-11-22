@@ -153,8 +153,61 @@ def unsupported_parts(plugin_dir: Path, manifest: dict, hooks: dict) -> list:
     return notes
 
 
-def hooks_digest(hooks: dict) -> str:
-    return hashlib.sha256(json.dumps(hooks, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+OWNER_FILE = ".hermes-claude-plugins-owner"
+
+
+def tree_fingerprint(root) -> tuple:
+    """A cheap (path, mode, size, mtime) listing of the package, used to notice changes between hashes."""
+    root = Path(root)
+    items = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d != ".git")
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            items.append((path.relative_to(root).as_posix(), st.st_mode, st.st_size, st.st_mtime_ns))
+    return tuple(items)
+
+
+def tree_digest(root) -> str:
+    """sha256 over every file in the package: relative path, executable bit and contents (a link's target).
+    Hook commands run scripts from the package, so consent has to cover those files, not only hooks.json."""
+    root = Path(root)
+    if not root.is_dir():
+        raise TranslateError("package %s is missing" % root)
+    h = hashlib.sha256()
+    for rel, mode, _size, _mtime in tree_fingerprint(root):
+        path = root / rel
+        h.update(rel.encode("utf-8") + b"\0")
+        if os.path.islink(path):
+            h.update(b"L" + os.readlink(path).encode("utf-8", "surrogateescape"))
+        else:
+            h.update(b"X" if mode & 0o111 else b"F")
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 16), b""):
+                    h.update(chunk)
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def hooks_digest(hooks: dict, package_root) -> str:
+    """What hook consent is tied to: the hook definitions and every file of the installed package.
+    Changing a script a hook calls, even with the same command line, withdraws consent."""
+    h = hashlib.sha256()
+    h.update(json.dumps(hooks, sort_keys=True).encode("utf-8"))
+    h.update(b"\0")
+    h.update(tree_digest(package_root).encode("ascii"))
+    return h.hexdigest()
+
+
+def package_owner(package_root) -> str:
+    try:
+        return (Path(package_root) / OWNER_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def hook_commands(hooks: dict) -> list:
@@ -194,14 +247,23 @@ def _rewrite_root(text: str, root: Path) -> str:
     return ROOT_VAR.sub(str(root).replace("\\", "/"), text)
 
 
-def build_package(plugin_dir: Path, manifest: dict, version: str = "") -> dict:
+def build_package(plugin_dir: Path, manifest: dict, version: str = "", owner: str = "", adopt: bool = False) -> dict:
     """Copy the plugin to $HERMES_HOME/plugins/claude-<name>/ as an Agent Plugins v1 package.
+    `owner` (name@marketplace) is written into the package; an existing directory is only replaced
+    when it carries the same owner, or when `adopt` says the caller's own record points at it (a
+    package written before owners were recorded). Anything else, such as another marketplace's
+    plugin of the same name or a Hermes plugin that is not ours, is left alone.
     Returns {"package": path, "skills": [...], "mcp": [...], "notes": [...]}."""
     name = manifest["name"]
     pkg_name = paths.package_name(name)
     if not PORTABLE_NAME.match(pkg_name) or len(pkg_name) > 64:
         raise TranslateError("plugin name %r cannot be a Hermes package name (lowercase letters, digits, dots, hyphens)" % name)
     dest = paths.package_dir(name)
+    if dest.exists() or dest.is_symlink():
+        current = package_owner(dest)
+        if not ((owner and current == owner) or (adopt and not current and not dest.is_symlink())):
+            raise TranslateError("%s already exists and belongs to %s; uninstall it first" % (
+                dest, current or "something other than this plugin"))
     staging = dest.parent / (".incoming-" + dest.name)
     if staging.exists():
         shutil.rmtree(staging)
@@ -259,6 +321,7 @@ def build_package(plugin_dir: Path, manifest: dict, version: str = "") -> dict:
         package_manifest["keywords"] = [str(k) for k in manifest["keywords"]]
     with open(staging / "plugin.json", "w", encoding="utf-8") as fh:
         json.dump(package_manifest, fh, indent=2)
+    (staging / OWNER_FILE).write_text((owner or name) + "\n", encoding="utf-8")
 
     if dest.exists():
         shutil.rmtree(dest)
@@ -306,7 +369,7 @@ def command_skill_name(plugin: str, command: str) -> str:
     return slug[:64].rstrip("-")
 
 
-def build_command_skills(plugin_name: str, commands: list, package_root: Path) -> list:
+def build_command_skills(plugin_name: str, commands: list, package_root: Path, notes: list = None) -> list:
     """Write one skill per command into the command-skills directory. Returns the skill names."""
     out_root = paths.ensure(paths.command_skills_dir())
     remove_command_skills(plugin_name)
@@ -328,6 +391,11 @@ def build_command_skills(plugin_name: str, commands: list, package_root: Path) -
         text = "---\nname: %s\ndescription: %s\nmetadata:\n  claude_plugin: %s\n  claude_command: %s\n---\n\n%s%s" % (
             skill, _yaml_str(description), _yaml_str(plugin_name), _yaml_str(command), note, _rewrite_root(body, package_root))
         target = out_root / skill
+        owner_file = target / ".claude-plugin-owner"
+        if target.exists() and not (owner_file.is_file() and owner_file.read_text(encoding="utf-8").strip() == plugin_name):
+            if notes is not None:  # another plugin's command already has this skill name; never overwrite it
+                notes.append("command /%s:%s not installed: skill %s belongs to another plugin" % (plugin_name, command, skill))
+            continue
         target.mkdir(parents=True, exist_ok=True)
         (target / "SKILL.md").write_text(text, encoding="utf-8")
         (target / ".claude-plugin-owner").write_text(plugin_name + "\n", encoding="utf-8")

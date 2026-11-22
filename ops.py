@@ -21,7 +21,7 @@ def marketplace_add(source_text: str, name: str = None) -> str:
         staged = Path(tmp) / "m"
         rev = fetch.fetch(source, staged)
         data = M.read(staged)
-        mkt_name = name or data["name"]
+        mkt_name = M.check_name(name or data["name"])
         if mkt_name in state["marketplaces"] and state["marketplaces"][mkt_name].get("source") != source:
             raise OpError("a marketplace named %s already exists from %s; remove it first or pass --name" % (
                 mkt_name, fetch.describe(state["marketplaces"][mkt_name]["source"])))
@@ -107,23 +107,33 @@ def install(ref: str, accept_hooks: bool = False, enable: bool = True) -> list:
     mkt_dir = M.marketplace_dir(mkt)
     data = M.read(mkt_dir)
     item = M.entry(data, plugin)
+    key = store.plugin_key(plugin, mkt)
+    previous = state["plugins"].get(key, {})
+    # Every installed plugin owns one package directory (claude-<name>). A plugin of the same name
+    # from another marketplace must not replace it: its hooks were accepted for different files.
+    pkg_dir = paths.package_dir(plugin)
+    for other_key, other in state["plugins"].items():
+        if other_key != key and (other.get("package_name") == paths.package_name(plugin)
+                                 or other.get("package") == str(pkg_dir)):
+            raise OpError("%s is already installed as Hermes package %s; uninstall it before installing %s"
+                          % (other_key, paths.package_name(plugin), key))
+    adopt = previous.get("package") == str(pkg_dir)
     with tempfile.TemporaryDirectory(prefix="hermes-claude-plugin-") as tmp:
         pdir, rev = M.plugin_dir(mkt_dir, data, item, Path(tmp))
         manifest = translate.load_manifest(pdir, item)
         if manifest["name"] != plugin:
             raise OpError("marketplace entry %s points at a plugin named %s" % (plugin, manifest["name"]))
         version = str(manifest.get("version") or item.get("version") or rev or "0.0.0")
-        built = translate.build_package(pdir, manifest, version)
+        built = translate.build_package(pdir, manifest, version, owner=key, adopt=adopt)
     package_root = Path(built["package"])
     manifest = translate.load_manifest(package_root, item)
     hooks = translate.hooks_config(package_root, manifest)
     commands = translate.command_files(package_root, manifest)
-    command_skills = translate.build_command_skills(plugin, commands, package_root)
-    notes = built["notes"] + translate.unsupported_parts(package_root, manifest, hooks)
+    notes = list(built["notes"])
+    command_skills = translate.build_command_skills(plugin, commands, package_root, notes)
+    notes += translate.unsupported_parts(package_root, manifest, hooks)
 
-    key = store.plugin_key(plugin, mkt)
-    previous = state["plugins"].get(key, {})
-    digest = translate.hooks_digest(hooks)
+    digest = translate.hooks_digest(hooks, package_root)
     consented = previous.get("consented_digest") if previous.get("hooks_consent") else None
     if accept_hooks and hooks:
         consented = digest
@@ -141,7 +151,9 @@ def install(ref: str, accept_hooks: bool = False, enable: bool = True) -> list:
     report = ["installed %s %s as Hermes package %s" % (key, version, rec["package_name"])]
     report.append("  skills: %s" % (", ".join(built["skills"]) or "none"))
     report.append("  MCP servers: %s" % (", ".join(built["mcp"]) or "none"))
-    report.append("  commands: %s" % (", ".join("/%s (was /%s:%s)" % (s, plugin, c) for s, (c, _p) in zip(command_skills, commands)) or "none"))
+    installed_commands = [(translate.command_skill_name(plugin, c), c) for c, _p in commands]
+    report.append("  commands: %s" % (", ".join("/%s (was /%s:%s)" % (s, plugin, c) for s, c in installed_commands
+                                                if s in command_skills) or "none"))
     if hooks:
         state_txt = "ACCEPTED" if rec["hooks_consent"] else "NOT RUN until you accept them"
         report.append("  hooks (%s):" % state_txt)
@@ -168,7 +180,14 @@ def consent(ref: str, revoke: bool = False) -> list:
         rec.update(hooks_consent=False, consented_digest=None)
         store.save(state)
         return ["hooks of %s will no longer run" % key]
-    rec.update(hooks_consent=True, consented_digest=translate.hooks_digest(hooks))
+    try:
+        on_disk = translate.hooks_digest(hooks, rec["package"])
+    except translate.TranslateError as exc:
+        raise OpError("%s: %s; reinstall it" % (key, exc))
+    if on_disk != rec.get("hooks_digest"):
+        raise OpError("the files of %s changed since it was installed; run `hermes claude-plugins update %s` "
+                      "and review it again before accepting its hooks" % (key, key))
+    rec.update(hooks_consent=True, consented_digest=on_disk)
     store.save(state)
     return ["hooks of %s will run in Hermes:" % key] + ["  " + line for line in describe_hooks(hooks)]
 
@@ -177,7 +196,11 @@ def uninstall(ref: str) -> list:
     state = store.load()
     key, rec = store.find_plugin(state, ref)
     out = [hermes_glue.set_package_enabled(rec["package_name"], False)[1]]
-    shutil.rmtree(rec["package"], ignore_errors=True)
+    owner = translate.package_owner(rec["package"])
+    if owner in ("", key):
+        shutil.rmtree(rec["package"], ignore_errors=True)
+    else:
+        out.append("left %s in place: it belongs to %s" % (rec["package"], owner))
     translate.remove_command_skills(rec["name"])
     state["plugins"].pop(key)
     store.save(state)

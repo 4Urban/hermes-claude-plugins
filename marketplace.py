@@ -6,8 +6,21 @@ from pathlib import Path
 from . import fetch, paths
 
 
+# A marketplace name becomes a directory under marketplaces/, and the marketplace chooses it.
+# Only a single plain path component is accepted, so a name like "../../plugins/x" or "/etc"
+# can never point the replace-and-delete in fetch._replace_dir at another directory.
+SAFE_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
+
+
 class MarketplaceError(Exception):
     pass
+
+
+def check_name(name) -> str:
+    if not isinstance(name, str) or not SAFE_NAME.match(name) or ".." in name:
+        raise MarketplaceError("marketplace name %r is not allowed (letters, digits, dots, hyphens, underscores; "
+                               "at most 64 characters; pass --name to choose another)" % (name,))
+    return name
 
 
 def read(mkt_dir: Path) -> dict:
@@ -69,4 +82,8 @@ def plugin_dir(mkt_dir: Path, data: dict, item: dict, workdir: Path):
 
 
 def marketplace_dir(name: str) -> Path:
-    return paths.marketplaces_dir() / name
+    base = paths.marketplaces_dir()
+    target = base / check_name(name)
+    if target.resolve().parent != base.resolve():
+        raise MarketplaceError("marketplace %s resolves outside %s" % (name, base))
+    return target
