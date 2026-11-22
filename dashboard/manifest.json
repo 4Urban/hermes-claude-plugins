@@ -3,7 +3,7 @@
   "label": "Claude Plugins",
   "description": "Backend for the Claude Plugins desktop page: marketplaces, installs and hook consent",
   "icon": "Package",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "tab": {
     "path": "/claude-plugins",
     "hidden": true

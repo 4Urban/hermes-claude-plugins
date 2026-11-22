@@ -10,7 +10,7 @@
 // and sends back the digest the user saw, so consent cannot cover files that changed meanwhile.
 import {
   host, useValue, useQuery, queryClient, usePluginI18n,
-  Badge, Button, ConfirmDialog, EmptyState, ErrorState, Input, ListRow, SearchField, Skeleton, Switch,
+  Badge, Button, ConfirmDialog, DisclosureCaret, EmptyState, ErrorState, Input, ListRow, SearchField, Skeleton, Switch,
   Tabs, TabsList, TabsTrigger,
   ROUTES_AREA, SIDEBAR_NAV_AREA, PALETTE_AREA,
 } from '@hermes/plugin-sdk';
@@ -27,7 +27,8 @@ const locales = {
     description: 'Install Claude Code plugins into this profile. Skills, commands and MCP servers become a Hermes package; hooks run only after you accept them.',
     tabs: { marketplaces: 'Marketplaces', installed: 'Installed' },
     add: { title: 'Add a marketplace', source: 'owner/repo, git URL, URL to marketplace.json, or a local path', name: 'Name (optional)', submit: 'Add' },
-    search: 'Search plugins', refresh: 'Refresh', remove: 'Remove', install: 'Install', installed: 'Installed', update: 'Update',
+    search: 'Search plugins', expandAll: 'Expand all', collapseAll: 'Collapse all',
+    pluginCount: (shown, total) => shown === total ? `${total}` : `${shown} / ${total}`, refresh: 'Refresh', remove: 'Remove', install: 'Install', installed: 'Installed', update: 'Update',
     removeMarketplace: name => `Remove the marketplace ${name}?`,
     removeMarketplaceHelp: 'Plugins installed from it must be uninstalled first.',
     uninstall: name => `Uninstall ${name}?`,
@@ -56,7 +57,8 @@ const locales = {
     description: 'Claude Code 플러그인을 이 프로필에 설치합니다. 스킬·명령·MCP 서버는 Hermes 패키지가 되고, 훅은 승인한 뒤에만 실행됩니다.',
     tabs: { marketplaces: '마켓플레이스', installed: '설치됨' },
     add: { title: '마켓플레이스 추가', source: 'owner/repo, git URL, marketplace.json URL 또는 로컬 경로', name: '이름 (선택)', submit: '추가' },
-    search: '플러그인 검색', refresh: '새로고침', remove: '삭제', install: '설치', installed: '설치됨', update: '업데이트',
+    search: '플러그인 검색', expandAll: '모두 펼치기', collapseAll: '모두 접기',
+    pluginCount: (shown, total) => shown === total ? `${total}` : `${shown} / ${total}`, refresh: '새로고침', remove: '삭제', install: '설치', installed: '설치됨', update: '업데이트',
     removeMarketplace: name => `마켓플레이스 ${name}을(를) 삭제할까요?`,
     removeMarketplaceHelp: '여기서 설치한 플러그인을 먼저 삭제해야 합니다.',
     uninstall: name => `${name}을(를) 삭제할까요?`,
@@ -121,30 +123,54 @@ function AddMarketplace({ api, busy }) {
   ] });
 }
 
-function Marketplaces({ data, api, busyKeys }) {
+// Open marketplaces are remembered per viewer (ctx.storage); new ones start collapsed, since a
+// marketplace can list hundreds of plugins. A search opens every marketplace with a match.
+function useOpenMarketplaces(storage) {
+  const read = () => { try { return new Set(storage.get('openMarketplaces', [])); } catch { return new Set(); } };
+  const [open, setOpen] = useState(read);
+  const save = next => { setOpen(next); try { storage.set('openMarketplaces', [...next]); } catch { /* best effort */ } };
+  return [open, name => { const next = new Set(open); next.has(name) ? next.delete(name) : next.add(name); save(next); },
+    names => save(new Set(names))];
+}
+
+function Marketplaces({ data, api, busyKeys, storage }) {
   const t = usePluginI18n(ID);
   const [search, setSearch] = useState('');
   const [removing, setRemoving] = useState(null);
+  const [open, toggleOpen, setAll] = useOpenMarketplaces(storage);
   const q = search.trim().toLowerCase();
   const match = p => !q || p.name.toLowerCase().includes(q) || p.description.toLowerCase().includes(q);
+  const names = data.marketplaces.map(m => m.name);
+  const allOpen = names.length > 0 && names.every(n => open.has(n));
   return jsxs('div', { className: 'space-y-5', children: [
     jsx(AddMarketplace, { api, busy: busyKeys.has('marketplace_add') }),
-    data.marketplaces.length > 0 && jsx(SearchField, { placeholder: t('search'), value: search, onChange: setSearch }),
+    data.marketplaces.length > 0 && jsxs('div', { className: 'flex items-center gap-2', children: [
+      jsx(SearchField, { containerClassName: 'flex-1', placeholder: t('search'), value: search, onChange: setSearch }),
+      jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', onClick: () => setAll(allOpen ? [] : names),
+        children: allOpen ? t('collapseAll') : t('expandAll') }),
+    ] }),
     data.marketplaces.length === 0
       ? jsx(EmptyState, { title: t('noMarketplaces'), description: t('noMarketplacesHelp') })
       : data.marketplaces.map(m => {
         const plugins = m.plugins.filter(match);
+        if (q && plugins.length === 0 && !m.error) return null;
+        const expanded = q ? true : open.has(m.name);
         return jsxs('section', { className: 'space-y-1', children: [
           jsxs('div', { className: 'flex flex-wrap items-center gap-2', children: [
-            jsx('h2', { className: 'text-sm font-semibold', children: m.name }),
-            jsx('span', { className: 'text-xs text-(--ui-text-tertiary)', children: m.source }),
+            jsxs('button', { type: 'button', className: 'flex min-w-0 items-center gap-1.5 text-left',
+              'aria-expanded': expanded, disabled: Boolean(q), onClick: () => toggleOpen(m.name), children: [
+                jsx(DisclosureCaret, { open: expanded, className: 'text-(--ui-text-quaternary)' }),
+                jsx('h2', { className: 'text-sm font-semibold', children: m.name }),
+                jsx(Badge, { variant: 'muted', size: 'xs', children: t('pluginCount', plugins.length, m.plugins.length) }),
+              ] }),
+            jsx('span', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: m.source }),
             jsx('span', { className: 'flex-1' }),
             jsx(Button, { type: 'button', size: 'xs', variant: 'outline', disabled: busyKeys.has('marketplace_update:' + m.name),
               onClick: () => api.job('marketplace_update', `/marketplaces/${enc(m.name)}/refresh`, null), children: t('refresh') }),
             jsx(Button, { type: 'button', size: 'xs', variant: 'ghost', onClick: () => setRemoving(m.name), children: t('remove') }),
           ] }),
           m.error && jsx('p', { className: 'text-xs text-(--ui-text-tertiary)', children: t('unreadable', m.error) }),
-          plugins.length === 0 && !m.error
+          !expanded ? null : plugins.length === 0 && !m.error
             ? jsx('p', { className: 'py-2 text-xs text-(--ui-text-tertiary)', children: t('noPlugins') })
             : plugins.map(p => {
               const ref = `${p.name}@${m.name}`;
@@ -314,7 +340,7 @@ function Page({ ctx, scope, current }) {
   if (query.isPending) body = jsxs('div', { role: 'status', children: [t('loading'), jsx(Skeleton, { className: 'h-24 w-full' })] });
   else if (query.isError) body = jsx(Failure, { error: query.error, retry: query.refetch });
   else body = tab === 'marketplaces'
-    ? jsx(Marketplaces, { data: query.data, api, busyKeys })
+    ? jsx(Marketplaces, { data: query.data, api, busyKeys, storage: ctx.storage })
     : jsx(Installed, { data: query.data, api, busyKeys });
   const forgotten = query.data?.forgotten || [];
   return jsxs('main', { className: 'h-full overflow-auto p-5 space-y-5 text-sm text-(--ui-text-primary)', children: [
