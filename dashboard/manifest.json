@@ -1,0 +1,13 @@
+{
+  "name": "claude-plugins",
+  "label": "Claude Plugins",
+  "description": "Backend for the Claude Plugins desktop page: marketplaces, installs and hook consent",
+  "icon": "Package",
+  "version": "0.2.0",
+  "tab": {
+    "path": "/claude-plugins",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

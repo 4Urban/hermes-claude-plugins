@@ -367,6 +367,118 @@ class TestSecurity(Base):
             os.environ.pop("HERMES_SAFE_MODE")
 
 
+class TestHermesLoadedFiles(Base):
+    """A Claude plugin must not smuggle in files Hermes loads as its own plugin code."""
+
+    def test_stripped(self):
+        plug = self.mkt / "plugins" / "demo"
+        (plug / "plugin.yaml").write_text("name: claude-demo\n")
+        (plug / "__init__.py").write_text("def register(ctx):\n    raise SystemExit('ran')\n")
+        (plug / "plugin.js").write_text("export default {}\n")
+        (plug / "desktop").mkdir()
+        (plug / "desktop" / "plugin.js").write_text("export default {}\n")
+        (plug / "dashboard").mkdir()
+        (plug / "dashboard" / "manifest.json").write_text('{"api": "plugin_api.py"}')
+        (plug / "dashboard" / "plugin_api.py").write_text("raise SystemExit('ran')\n")
+        ops.marketplace_update("testmkt")
+        report = "\n".join(ops.install("demo"))
+        pkg = paths.package_dir("demo")
+        for rel in translate.HERMES_LOADED_FILES:
+            self.assertFalse((pkg / rel).exists(), rel)
+        for rel in ("plugin.yaml", "plugin.js", "desktop/plugin.js", "dashboard/manifest.json"):
+            self.assertIn("%s removed" % rel, report)
+        self.assertTrue((pkg / "plugin.json").is_file())
+
+
+class TestReconcileAndRecords(Base):
+    def test_package_removed_elsewhere(self):
+        ops.install("demo")
+        shutil.rmtree(paths.package_dir("demo"))  # as `hermes plugins remove claude-demo` would
+        self.assertEqual(ops.reconcile(), ["demo@testmkt"])
+        self.assertEqual(store.load()["plugins"], {})
+        self.assertFalse((paths.command_skills_dir() / "demo-hello").exists())
+
+    def test_records(self):
+        ops.install("demo")
+        mkts = ops.marketplace_records()
+        self.assertEqual(mkts[0]["name"], "testmkt")
+        self.assertTrue(mkts[0]["plugins"][0]["installed"])
+        rows = ops.plugin_records((({"claude-demo"}), set()))
+        self.assertTrue(rows[0]["enabled"])
+        self.assertFalse(rows[0]["hooks_consent"])
+        self.assertIn("SessionStart", {h["event"] for h in rows[0]["hooks"]})
+        self.assertIsNone(ops.plugin_records(None)[0]["enabled"])
+
+    def test_consent_needs_the_digest_shown(self):
+        ops.install("demo")
+        with self.assertRaises(ops.OpError):
+            ops.consent("demo", expected_digest="0" * 64)
+        ops.consent("demo", expected_digest=store.load()["plugins"]["demo@testmkt"]["hooks_digest"])
+        self.assertTrue(store.load()["plugins"]["demo@testmkt"]["hooks_consent"])
+
+    def test_lock_is_reentrant(self):
+        with store.locked():
+            with store.locked():
+                ops.install("demo")
+        self.assertIn("demo@testmkt", store.load()["plugins"])
+
+
+try:
+    import fastapi  # noqa: F401
+    from fastapi.testclient import TestClient
+except ImportError:
+    TestClient = None
+
+
+@unittest.skipIf(TestClient is None, "fastapi not installed (run with Hermes's Python)")
+class TestDashboardApi(Base):
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("hcp_plugin_api", ROOT / "dashboard" / "plugin_api.py")
+        api = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(api)
+        app = fastapi.FastAPI()
+        app.include_router(api.router, prefix="/api/plugins/claude-plugins")
+        self.client = TestClient(app)
+
+    def call(self, method, path, **kw):
+        return self.client.request(method, "/api/plugins/claude-plugins" + path, **kw)
+
+    def wait(self, job):
+        import time
+        for _ in range(200):
+            job = self.call("GET", "/jobs/" + job["id"]).json()
+            if job["status"] != "running":
+                return job
+            time.sleep(0.05)
+        self.fail("job did not finish")
+
+    def test_flow(self):
+        st = self.call("GET", "/state").json()
+        self.assertEqual([m["name"] for m in st["marketplaces"]], ["testmkt"])
+        job = self.wait(self.call("POST", "/plugins", json={"ref": "demo@testmkt"}).json())
+        self.assertEqual(job["status"], "done", job)
+        plugin = self.call("GET", "/state").json()["plugins"][0]
+        self.assertEqual(plugin["key"], "demo@testmkt")
+        self.assertFalse(plugin["hooks_consent"], "install never accepts hooks")
+        bad = self.call("POST", "/plugins/demo@testmkt/consent", json={"digest": "nope"})
+        self.assertEqual(bad.status_code, 400)
+        ok = self.call("POST", "/plugins/demo@testmkt/consent", json={"digest": plugin["hooks_digest"]})
+        self.assertEqual(ok.status_code, 200, ok.text)
+        self.assertTrue(self.call("GET", "/state").json()["plugins"][0]["hooks_consent"])
+        self.assertEqual(self.call("DELETE", "/plugins/demo@testmkt/consent").status_code, 200)
+        self.assertEqual(self.call("DELETE", "/plugins/demo@testmkt").status_code, 200)
+        self.assertEqual(self.call("GET", "/state").json()["plugins"], [])
+        self.assertEqual(self.call("DELETE", "/marketplaces/testmkt").status_code, 200)
+
+    def test_errors(self):
+        job = self.wait(self.call("POST", "/marketplaces", json={"source": str(self.mkt), "name": "../x"}).json())
+        self.assertEqual(job["status"], "error")
+        self.assertEqual(self.call("POST", "/plugins", json={}).status_code, 422)
+        self.assertEqual(self.call("GET", "/jobs/nope").status_code, 404)
+        self.assertEqual(self.call("DELETE", "/plugins/nope").status_code, 400)
+
+
 class TestRegister(unittest.TestCase):
     def test_register(self):
         seen = {"cli": [], "cmd": [], "hooks": []}

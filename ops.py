@@ -14,6 +14,7 @@ class OpError(Exception):
 
 # ---- marketplaces ---------------------------------------------------------
 
+@store.serialised
 def marketplace_add(source_text: str, name: str = None) -> str:
     source = fetch.parse_source(source_text)
     state = store.load()
@@ -32,6 +33,7 @@ def marketplace_add(source_text: str, name: str = None) -> str:
         mkt_name, fetch.describe(source), len(data["plugins"]), ", ".join(p.get("name", "?") for p in data["plugins"]))
 
 
+@store.serialised
 def marketplace_update(name: str = None) -> list:
     state = store.load()
     names = [name] if name else sorted(state["marketplaces"])
@@ -48,6 +50,7 @@ def marketplace_update(name: str = None) -> list:
     return out
 
 
+@store.serialised
 def marketplace_remove(name: str) -> str:
     state = store.load()
     if name not in state["marketplaces"]:
@@ -99,6 +102,7 @@ def describe_hooks(hooks: dict) -> list:
             for event, matcher, command, _t in translate.hook_commands(hooks)]
 
 
+@store.serialised
 def install(ref: str, accept_hooks: bool = False, enable: bool = True) -> list:
     state = store.load()
     plugin, mkt = _split_ref(state, ref)
@@ -170,7 +174,10 @@ def install(ref: str, accept_hooks: bool = False, enable: bool = True) -> list:
     return report
 
 
-def consent(ref: str, revoke: bool = False) -> list:
+@store.serialised
+def consent(ref: str, revoke: bool = False, expected_digest: str = None) -> list:
+    """Accept (or revoke) a plugin's hooks. `expected_digest` is the digest the user was shown: the
+    desktop page passes it so consent never covers files that changed after they were reviewed."""
     state = store.load()
     key, rec = store.find_plugin(state, ref)
     hooks = rec.get("hooks") or {}
@@ -184,6 +191,8 @@ def consent(ref: str, revoke: bool = False) -> list:
         on_disk = translate.hooks_digest(hooks, rec["package"])
     except translate.TranslateError as exc:
         raise OpError("%s: %s; reinstall it" % (key, exc))
+    if expected_digest is not None and expected_digest != on_disk:
+        raise OpError("the hooks of %s changed while you were reviewing them; review them again" % key)
     if on_disk != rec.get("hooks_digest"):
         raise OpError("the files of %s changed since it was installed; run `hermes claude-plugins update %s` "
                       "and review it again before accepting its hooks" % (key, key))
@@ -192,6 +201,7 @@ def consent(ref: str, revoke: bool = False) -> list:
     return ["hooks of %s will run in Hermes:" % key] + ["  " + line for line in describe_hooks(hooks)]
 
 
+@store.serialised
 def uninstall(ref: str) -> list:
     state = store.load()
     key, rec = store.find_plugin(state, ref)
@@ -208,6 +218,7 @@ def uninstall(ref: str) -> list:
     return out
 
 
+@store.serialised
 def update(ref: str = None) -> list:
     state = store.load()
     keys = [store.find_plugin(state, ref)[0]] if ref else sorted(state["plugins"])
@@ -222,6 +233,7 @@ def update(ref: str = None) -> list:
     return out
 
 
+@store.serialised
 def sync() -> list:
     """Re-translate every installed plugin from the cached marketplaces, without fetching."""
     state = store.load()
@@ -231,7 +243,73 @@ def sync() -> list:
     return out or ["nothing installed"]
 
 
+@store.serialised
+def reconcile() -> list:
+    """Forget plugins whose package directory is gone (removed through `hermes plugins remove` or
+    the desktop Plugins page), along with their command skills. Returns the keys forgotten."""
+    state = store.load()
+    gone = [k for k, rec in state["plugins"].items() if not Path(rec.get("package") or "").is_dir()]
+    for key in gone:
+        rec = state["plugins"].pop(key)
+        if not any(other.get("name") == rec.get("name") for other in state["plugins"].values()):
+            translate.remove_command_skills(rec.get("name", ""))
+    if gone:
+        store.save(state)
+    return gone
+
+
+# ---- structured views (desktop page) ---------------------------------------
+
+def _hook_rows(hooks: dict) -> list:
+    return [{"event": event, "matcher": matcher or "", "command": command,
+             "supported": event in translate.SUPPORTED_EVENTS}
+            for event, matcher, command, _t in translate.hook_commands(hooks)]
+
+
+def marketplace_records() -> list:
+    state = store.load()
+    installed = {(v.get("marketplace"), v.get("name")) for v in state["plugins"].values()}
+    out = []
+    for name, rec in sorted(state["marketplaces"].items()):
+        row = {"name": name, "source": fetch.describe(rec["source"]), "revision": rec.get("revision") or "",
+               "updated_at": rec.get("updated_at") or "", "plugins": [], "error": None}
+        try:
+            for item in M.read(M.marketplace_dir(name))["plugins"]:
+                pname = item.get("name") or "?"
+                row["plugins"].append({
+                    "name": pname, "description": str(item.get("description") or ""),
+                    "version": str(item.get("version") or ""), "category": str(item.get("category") or ""),
+                    "installed": (name, pname) in installed})
+        except Exception as exc:
+            row["error"] = str(exc)
+        out.append(row)
+    return out
+
+
+def plugin_records(selection=None) -> list:
+    """Installed plugins. `selection` is Hermes's (enabled, disabled) package names, or None when
+    unknown; `enabled` is then None rather than a guess."""
+    state = store.load()
+    out = []
+    for key, rec in sorted(state["plugins"].items()):
+        hooks = rec.get("hooks") or {}
+        package = rec.get("package_name") or paths.package_name(rec.get("name", ""))
+        enabled = None
+        if selection is not None:
+            enabled = package in selection[0] and package not in selection[1]
+        out.append({
+            "key": key, "name": rec.get("name"), "marketplace": rec.get("marketplace"),
+            "version": rec.get("version"), "package_name": package, "package": rec.get("package"),
+            "enabled": enabled, "skills": rec.get("skills") or [], "mcp": rec.get("mcp") or [],
+            "command_skills": rec.get("command_skills") or [], "notes": rec.get("notes") or [],
+            "hooks": _hook_rows(hooks), "hooks_digest": rec.get("hooks_digest") if hooks else None,
+            "hooks_consent": bool(rec.get("hooks_consent")) if hooks else None,
+            "updated_at": rec.get("updated_at") or ""})
+    return out
+
+
 def plugin_list() -> list:
+    reconcile()
     state = store.load()
     out = []
     for key, rec in sorted(state["plugins"].items()):
@@ -259,6 +337,7 @@ def show(ref: str) -> list:
     return out
 
 
+@store.serialised
 def import_claude(claude_dir: str = "~/.claude", accept_hooks: bool = False) -> list:
     """Replicate the marketplaces and user-scope plugins of a Claude Code installation."""
     base = Path(os.path.expanduser(claude_dir)) / "plugins"

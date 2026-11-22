@@ -1,8 +1,16 @@
 """The bridge's state file: marketplaces, installed plugins and hook consent."""
+import contextlib
+import functools
 import json
 import os
 import tempfile
+import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows: threads are still serialised, processes are not
+    fcntl = None
 
 from . import paths
 
@@ -55,3 +63,37 @@ def find_plugin(state: dict, ref: str):
     if len(matches) > 1:
         raise LookupError("%s is installed from more than one marketplace: %s" % (ref, ", ".join(k for k, _ in matches)))
     raise LookupError("%s is not installed" % ref)
+
+
+_LOCK = threading.RLock()
+_DEPTH = threading.local()
+
+
+@contextlib.contextmanager
+def locked():
+    """Serialise state changes between threads (the desktop page runs jobs in the background) and
+    between processes (the CLI, the gateway and a profile's plugin host can all write state.json).
+    Re-entrant, so an operation that calls another (update -> install) takes the lock once."""
+    with _LOCK:
+        depth = getattr(_DEPTH, "n", 0)
+        fh = None
+        if depth == 0 and fcntl is not None:
+            paths.ensure(paths.root(), private=True)
+            fh = open(paths.root() / "state.lock", "a+")
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        _DEPTH.n = depth + 1
+        try:
+            yield
+        finally:
+            _DEPTH.n = depth
+            if fh is not None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+
+
+def serialised(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with locked():
+            return fn(*args, **kwargs)
+    return wrapper

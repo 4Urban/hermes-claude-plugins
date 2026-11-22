@@ -22,12 +22,22 @@ def register_command_skills_dir():
 
 def set_package_enabled(package: str, enable: bool):
     """Enable or disable a generated Agent Plugins package. Returns (ok, message)."""
+    hint = "run `hermes plugins %s %s`" % ("enable" if enable else "disable", package)
+    try:  # the entry point the dashboard and the desktop's plugins.manage use
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+    except Exception:
+        dashboard_set_agent_plugin_enabled = None
     try:
-        from hermes_cli.plugins_cmd import _set_plugin_enabled
-        _set_plugin_enabled(package, enable=enable)
+        if dashboard_set_agent_plugin_enabled is not None:
+            result = dashboard_set_agent_plugin_enabled(package, enabled=enable)
+            if not result.get("ok"):
+                return False, "%s (%s)" % (hint, result.get("error") or "refused")
+        else:
+            from hermes_cli.plugins_cmd import _set_plugin_enabled
+            _set_plugin_enabled(package, enable=enable)
         return True, "%s %s" % ("enabled" if enable else "disabled", package)
     except Exception as exc:
-        return False, "run `hermes plugins %s %s` (%s)" % ("enable" if enable else "disable", package, exc)
+        return False, "%s (%s)" % (hint, exc)
 
 
 def config_path():

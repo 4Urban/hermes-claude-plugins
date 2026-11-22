@@ -46,6 +46,21 @@ relative paths, `github`, `url` or `git-subdir` entries, and a pinned `sha` is h
 `hermes claude-plugins import-claude` adds the same marketplaces and installs the plugins that are
 installed for the user there (project-scoped installs are skipped).
 
+## Desktop app
+
+The plugin adds a **Claude Plugins** page to the Hermes desktop app (sidebar, or ⌘K → Open Claude
+Plugins). Restart the gateway after installing or updating the plugin so its API loads, then enable
+the page under **Capabilities → Plugins** if it does not appear.
+
+- **Marketplaces:** add, refresh or remove a marketplace, search its plugins and install them.
+  An installed plugin's package is enabled right away, through the same call the Plugins page uses.
+- **Installed:** switch a plugin's package on or off, update it, uninstall it, and review its hooks.
+  Accepting hooks shows every command first, and consent is tied to what you saw: if the package
+  changed in the meantime the page asks you to review again.
+
+The page works on the profile the app is connected to; each profile needs hermes-claude-plugins
+installed. A package removed on the Plugins page is forgotten here the next time the page loads.
+
 ## Hooks
 
 Hooks run shell commands, so they never run until you accept them for that plugin:
@@ -65,6 +80,10 @@ an unreadable plugin selection or `HERMES_SAFE_MODE` runs none.
 
 Hooks accepted under 0.1.1 or earlier need accepting again after upgrading, because consent now
 covers the package files as well.
+
+Files that Hermes itself would load as plugin code are removed from a translated package:
+`plugin.yaml` / `plugin.yml` (a native Python plugin), `dashboard/manifest.json` (a web API),
+and `plugin.js` / `desktop/plugin.js` (desktop app code). `show` lists what was removed.
 
 Each plugin owns its package directory. Installing a plugin whose name is already installed from
 another marketplace, or whose `claude-<plugin>` directory belongs to something else, is refused

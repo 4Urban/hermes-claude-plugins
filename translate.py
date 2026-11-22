@@ -154,6 +154,12 @@ def unsupported_parts(plugin_dir: Path, manifest: dict, hooks: dict) -> list:
 
 
 OWNER_FILE = ".hermes-claude-plugins-owner"
+# Files Hermes itself loads from a folder under $HERMES_HOME/plugins/, beyond the Agent Plugins
+# package (plugin.json, skills/, mcp.json) this bridge writes. A Claude plugin that ships one of
+# them would run code with no hook consent at all once its package is enabled: plugin.yaml makes
+# the folder a native Python plugin (it wins over plugin.json), dashboard/manifest.json mounts its
+# plugin_api.py in the web server, and plugin.js / desktop/plugin.js load in the desktop app.
+HERMES_LOADED_FILES = ("plugin.yaml", "plugin.yml", "plugin.js", "desktop/plugin.js", "dashboard/manifest.json")
 
 
 def tree_fingerprint(root) -> tuple:
@@ -270,6 +276,14 @@ def build_package(plugin_dir: Path, manifest: dict, version: str = "", owner: st
     paths.ensure(dest.parent)
     shutil.copytree(plugin_dir, staging, ignore=shutil.ignore_patterns(".git"), symlinks=False)
     notes = []
+    for rel in HERMES_LOADED_FILES:
+        target = staging / rel
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            notes.append("%s removed: Hermes would load it as its own plugin code, outside hook consent" % rel)
 
     # Skills: Hermes reads <package>/skills/<name>/SKILL.md. Copy any extra skill paths in.
     skills = []
